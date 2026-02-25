@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.edfplus.info)",
+      "WebSearch",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:pyedflib.readthedocs.io)",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(rustc:*)",
+      "Bash(cargo run:*)",
+      "Bash(wc:*)",
+      "Bash(cargo doc:*)"
+    ]
+  }
+}

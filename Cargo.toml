@@ -1,0 +1,28 @@
+[package]
+name = "european-data-format"
+version = "0.1.0"
+edition = "2024"
+authors = ["Joel Parker Henderson <joel@joelparkerhenderson.com>"]
+description = "European Data Format (EDF/EDF+) utilities to read and write EDF files, EDF+ files, XML files, JSON files."
+repository = "https://github.com/sixarm/european-data-format-rust-crate/"
+license = "MIT OR Apache-2.0 OR BSD-3-Clause OR GPL-2.0-only OR GPL-3.0-only"
+keywords = ["edf", "edf+", "medical", "data", "test"]
+categories = ["command-line-utilities", "data-structures", "parser-implementations", "science", "science::neuroscience"]
+include = ["src/**/*", "LICENSE.md", "README.md", "llms.txt", "llms.json"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = { version = "0.37", features = ["serialize"] }
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+assertables = "9.8.6" # Assert macros for better testing
+cargo-diet = "1.2.7" # Make your crate lean
+cargo-deny = "0.19.0" # Lint dependencies
+cargo-dist = "0.30.4" # Distribution builder for release engineering
+cargo-release = "1.0.0" # Release automation
+cargo-semver-checks = "0.46.0" # Scan for semantic version errors
+regex = "1.12.3" # Regular expressions parser, compiler, and executer
+rustdoc-md = "0.2.0" # Convert Rust documentation JSON into clean, organized Markdown files.
