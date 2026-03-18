@@ -13,7 +13,8 @@
       "Bash(rustc:*)",
       "Bash(cargo run:*)",
       "Bash(wc:*)",
-      "Bash(cargo doc:*)"
+      "Bash(cargo doc:*)",
+      "Bash(ls:*)"
     ]
   }
 }
