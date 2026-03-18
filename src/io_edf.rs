@@ -356,4 +356,533 @@ mod tests {
         assert!(grouped[1][0].texts.is_empty());
         assert_eq!(grouped[1][1].texts, vec!["Event B"]);
     }
+
+    // ── Edge Case Tests: Contiguous Data (Edge Case 1) ───────────────
+
+    #[test]
+    fn test_edge_case_edf_plus_contiguous_round_trip() {
+        // EDF+C (contiguous) means data records are consecutive with no time gaps.
+        // The timekeeping TAL onsets should be sequential:
+        // record 0 → onset 0.0, record 1 → onset 1.0, etc.
+        // This test verifies that a contiguous EDF+ file round-trips correctly.
+        let edf = EdfFile {
+            header: EdfHeader {
+                version: "0".into(),
+                patient_identification: "X X X X".into(),
+                recording_identification: "Startdate X X X X".into(),
+                start_date: "01.01.00".into(),
+                start_time: "00.00.00".into(),
+                header_bytes: 768,
+                reserved: "EDF+C".into(), // contiguous
+                data_records_count: 3,
+                data_record_duration: 1.0,
+                signals_count: 2,
+                signal_headers: vec![
+                    make_ordinary_header("EEG", 4),
+                    make_annotation_header(15),
+                ],
+            },
+            signals: vec![EdfSignal {
+                header: make_ordinary_header("EEG", 4),
+                records: vec![
+                    EdfDataRecord { sample: vec![10, 20, 30, 40] },
+                    EdfDataRecord { sample: vec![50, 60, 70, 80] },
+                    EdfDataRecord { sample: vec![90, 100, 110, 120] },
+                ],
+            }],
+            annotations: vec![
+                // Timekeeping TALs for each record
+                EdfAnnotation { onset: 0.0, duration: None, texts: vec![] },
+                EdfAnnotation { onset: 1.0, duration: None, texts: vec![] },
+                EdfAnnotation { onset: 2.0, duration: None, texts: vec![] },
+            ],
+        };
+
+        let mut buf = Vec::new();
+        write_edf(&edf, &mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = read_edf(&mut cursor).unwrap();
+
+        // All 3 timekeeping annotations should be preserved with correct onsets
+        assert_eq!(parsed.annotations.len(), 3);
+        assert_eq!(parsed.annotations[0].onset, 0.0);
+        assert_eq!(parsed.annotations[1].onset, 1.0);
+        assert_eq!(parsed.annotations[2].onset, 2.0);
+
+        // Signal data should be preserved exactly
+        assert_eq!(parsed.signals[0].records[0].sample, vec![10, 20, 30, 40]);
+        assert_eq!(parsed.signals[0].records[2].sample, vec![90, 100, 110, 120]);
+    }
+
+    // ── Edge Case Tests: Discontinuous Data (Edge Case 2) ────────────
+
+    #[test]
+    fn test_edge_case_edf_plus_discontinuous_with_time_gap() {
+        // EDF+D (discontinuous) allows time gaps between data records. The
+        // timekeeping TAL in each record specifies the actual start time.
+        // Here, record 0 starts at t=0, record 1 starts at t=10 (9-second gap).
+        // This is common in event-triggered recordings like EMG nerve conduction.
+        let edf = EdfFile {
+            header: EdfHeader {
+                version: "0".into(),
+                patient_identification: "X X X X".into(),
+                recording_identification: "Startdate X X X X".into(),
+                start_date: "01.01.00".into(),
+                start_time: "00.00.00".into(),
+                header_bytes: 768,
+                reserved: "EDF+D".into(), // discontinuous
+                data_records_count: 2,
+                data_record_duration: 0.05,
+                signals_count: 2,
+                signal_headers: vec![
+                    make_ordinary_header("EMG", 4),
+                    make_annotation_header(15),
+                ],
+            },
+            signals: vec![EdfSignal {
+                header: make_ordinary_header("EMG", 4),
+                records: vec![
+                    EdfDataRecord { sample: vec![100, -200, 300, -400] },
+                    EdfDataRecord { sample: vec![150, -250, 350, -450] },
+                ],
+            }],
+            annotations: vec![
+                // Record 0: onset at t=0 (wrist stimulation)
+                EdfAnnotation { onset: 0.0, duration: None, texts: vec![] },
+                EdfAnnotation { onset: 0.0, duration: None, texts: vec!["Wrist stimulus".into()] },
+                // Record 1: onset at t=10 (elbow stimulation, 10 seconds later)
+                EdfAnnotation { onset: 10.0, duration: None, texts: vec![] },
+                EdfAnnotation { onset: 10.0, duration: None, texts: vec!["Elbow stimulus".into()] },
+            ],
+        };
+
+        let mut buf = Vec::new();
+        write_edf(&edf, &mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = read_edf(&mut cursor).unwrap();
+
+        // Verify the time gap is preserved: record 0 at t=0, record 1 at t=10
+        assert_eq!(parsed.annotations.len(), 4);
+        assert_eq!(parsed.annotations[0].onset, 0.0);
+        assert_eq!(parsed.annotations[2].onset, 10.0);
+
+        // Content annotations should be preserved
+        assert_eq!(parsed.annotations[1].texts, vec!["Wrist stimulus"]);
+        assert_eq!(parsed.annotations[3].texts, vec!["Elbow stimulus"]);
+    }
+
+    // ── Edge Case Tests: Data Type Handling (Edge Case 5) ────────────
+
+    #[test]
+    fn test_edge_case_16bit_sample_range_boundaries() {
+        // EDF stores samples as 16-bit signed integers (little-endian).
+        // Valid range: -32768 to 32767. This test verifies that extreme
+        // values at both ends of the i16 range survive round-trip correctly.
+        let edf = EdfFile {
+            header: EdfHeader {
+                version: "0".into(),
+                patient_identification: "X X X X".into(),
+                recording_identification: "Startdate X X X X".into(),
+                start_date: "01.01.00".into(),
+                start_time: "00.00.00".into(),
+                header_bytes: 768,
+                reserved: "EDF+C".into(),
+                data_records_count: 1,
+                data_record_duration: 1.0,
+                signals_count: 2,
+                signal_headers: vec![
+                    make_ordinary_header("Test", 5),
+                    make_annotation_header(10),
+                ],
+            },
+            signals: vec![EdfSignal {
+                header: make_ordinary_header("Test", 5),
+                records: vec![EdfDataRecord {
+                    // Test boundary values: min, max, zero, and near-boundaries
+                    sample: vec![i16::MIN, i16::MAX, 0, i16::MIN + 1, i16::MAX - 1],
+                }],
+            }],
+            annotations: vec![EdfAnnotation { onset: 0.0, duration: None, texts: vec![] }],
+        };
+
+        let mut buf = Vec::new();
+        write_edf(&edf, &mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = read_edf(&mut cursor).unwrap();
+
+        assert_eq!(parsed.signals[0].records[0].sample, vec![-32768, 32767, 0, -32767, 32766]);
+    }
+
+    #[test]
+    fn test_edge_case_little_endian_byte_order() {
+        // EDF spec mandates little-endian byte order for sample values.
+        // For example, the value 256 (0x0100) should be stored as [0x00, 0x01].
+        // This test manually constructs bytes and verifies correct parsing.
+        let ann_header = make_annotation_header(10);
+        let sig_header = EdfSignalHeader {
+            label: "Test".into(),
+            transducer_type: String::new(),
+            physical_dimension: "uV".into(),
+            physical_minimum: -100.0,
+            physical_maximum: 100.0,
+            digital_minimum: -2048,
+            digital_maximum: 2047,
+            prefiltering: String::new(),
+            samples_per_record: 2,
+            reserved: String::new(),
+        };
+
+        let header = EdfHeader {
+            version: "0".into(),
+            patient_identification: "X X X X".into(),
+            recording_identification: "Startdate X X X X".into(),
+            start_date: "01.01.00".into(),
+            start_time: "00.00.00".into(),
+            header_bytes: 768,
+            reserved: "EDF+C".into(),
+            data_records_count: 1,
+            data_record_duration: 1.0,
+            signals_count: 2,
+            signal_headers: vec![sig_header.clone(), ann_header],
+        };
+
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+
+        // Manually write sample data in little-endian:
+        // Sample 1: 256 = 0x0100 → bytes [0x00, 0x01]
+        // Sample 2: -1 = 0xFFFF → bytes [0xFF, 0xFF]
+        buf.extend_from_slice(&[0x00, 0x01]); // 256 in LE
+        buf.extend_from_slice(&[0xFF, 0xFF]); // -1 in LE
+
+        // Write annotation signal (timekeeping TAL)
+        let tal_bytes = crate::annotation::encode_tals(
+            &[EdfAnnotation { onset: 0.0, duration: None, texts: vec![] }],
+            20,
+        );
+        buf.extend_from_slice(&tal_bytes);
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = read_edf(&mut cursor).unwrap();
+
+        assert_eq!(parsed.signals[0].records[0].sample[0], 256);
+        assert_eq!(parsed.signals[0].records[0].sample[1], -1);
+    }
+
+    // ── Edge Case Tests: Multiple Data Records (Edge Cases 1, 3) ─────
+
+    #[test]
+    fn test_edge_case_many_data_records_round_trip() {
+        // Test with a larger number of data records to verify that the
+        // read/write loop handles indexing correctly across many iterations.
+        // This catches off-by-one errors in record counting.
+        let num_records = 20;
+        let samples_per_record = 4;
+
+        let records: Vec<EdfDataRecord> = (0..num_records)
+            .map(|r| EdfDataRecord {
+                sample: (0..samples_per_record).map(|s| (r * 100 + s) as i16).collect(),
+            })
+            .collect();
+
+        let timekeeping: Vec<EdfAnnotation> = (0..num_records)
+            .map(|r| EdfAnnotation {
+                onset: r as f64,
+                duration: None,
+                texts: vec![],
+            })
+            .collect();
+
+        let edf = EdfFile {
+            header: EdfHeader {
+                version: "0".into(),
+                patient_identification: "X X X X".into(),
+                recording_identification: "Startdate X X X X".into(),
+                start_date: "01.01.00".into(),
+                start_time: "00.00.00".into(),
+                header_bytes: 768,
+                reserved: "EDF+C".into(),
+                data_records_count: num_records as i64,
+                data_record_duration: 1.0,
+                signals_count: 2,
+                signal_headers: vec![
+                    make_ordinary_header("EEG", samples_per_record),
+                    make_annotation_header(10),
+                ],
+            },
+            signals: vec![EdfSignal {
+                header: make_ordinary_header("EEG", samples_per_record),
+                records,
+            }],
+            annotations: timekeeping,
+        };
+
+        let mut buf = Vec::new();
+        write_edf(&edf, &mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = read_edf(&mut cursor).unwrap();
+
+        assert_eq!(parsed.signals[0].records.len(), num_records);
+        // Verify first and last record data
+        assert_eq!(parsed.signals[0].records[0].sample, vec![0, 1, 2, 3]);
+        assert_eq!(parsed.signals[0].records[19].sample, vec![1900, 1901, 1902, 1903]);
+    }
+
+    // ── Edge Case Tests: Multiple Signals (Edge Case 4) ──────────────
+
+    #[test]
+    fn test_edge_case_multiple_ordinary_signals() {
+        // An EDF file can have many ordinary signals (e.g., 19 EEG channels
+        // in a 10-20 montage, plus EMG, EOG, ECG). This test verifies that
+        // multiple ordinary signals are correctly separated and preserved
+        // through a round-trip, with each signal's data in the right place.
+        let edf = EdfFile {
+            header: EdfHeader {
+                version: "0".into(),
+                patient_identification: "X X X X".into(),
+                recording_identification: "Startdate X X X X".into(),
+                start_date: "01.01.00".into(),
+                start_time: "00.00.00".into(),
+                header_bytes: 256 + 4 * 256, // 4 signals
+                reserved: "EDF+C".into(),
+                data_records_count: 1,
+                data_record_duration: 1.0,
+                signals_count: 4,
+                signal_headers: vec![
+                    make_ordinary_header("EEG Fp1", 3),
+                    make_ordinary_header("EEG Fp2", 3),
+                    make_ordinary_header("EMG chin", 3),
+                    make_annotation_header(10),
+                ],
+            },
+            signals: vec![
+                EdfSignal {
+                    header: make_ordinary_header("EEG Fp1", 3),
+                    records: vec![EdfDataRecord { sample: vec![100, 200, 300] }],
+                },
+                EdfSignal {
+                    header: make_ordinary_header("EEG Fp2", 3),
+                    records: vec![EdfDataRecord { sample: vec![400, 500, 600] }],
+                },
+                EdfSignal {
+                    header: make_ordinary_header("EMG chin", 3),
+                    records: vec![EdfDataRecord { sample: vec![700, 800, 900] }],
+                },
+            ],
+            annotations: vec![EdfAnnotation { onset: 0.0, duration: None, texts: vec![] }],
+        };
+
+        let mut buf = Vec::new();
+        write_edf(&edf, &mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = read_edf(&mut cursor).unwrap();
+
+        // Verify each signal's data is in the correct position
+        assert_eq!(parsed.signals.len(), 3);
+        assert_eq!(parsed.signals[0].header.label, "EEG Fp1");
+        assert_eq!(parsed.signals[0].records[0].sample, vec![100, 200, 300]);
+        assert_eq!(parsed.signals[1].header.label, "EEG Fp2");
+        assert_eq!(parsed.signals[1].records[0].sample, vec![400, 500, 600]);
+        assert_eq!(parsed.signals[2].header.label, "EMG chin");
+        assert_eq!(parsed.signals[2].records[0].sample, vec![700, 800, 900]);
+    }
+
+    // ── Edge Case Tests: Annotation-Only File ────────────────────────
+
+    #[test]
+    fn test_edge_case_file_with_only_annotation_signal() {
+        // An EDF+ file can contain only an annotation signal and no ordinary
+        // signals. This is uncommon but valid — it would be a pure event log
+        // with no waveform data (e.g., nurse notes, medication log).
+        let edf = EdfFile {
+            header: EdfHeader {
+                version: "0".into(),
+                patient_identification: "X X X X".into(),
+                recording_identification: "Startdate X X X X".into(),
+                start_date: "01.01.00".into(),
+                start_time: "00.00.00".into(),
+                header_bytes: 512,
+                reserved: "EDF+C".into(),
+                data_records_count: 1,
+                data_record_duration: 1.0,
+                signals_count: 1,
+                signal_headers: vec![make_annotation_header(30)],
+            },
+            signals: vec![], // no ordinary signals
+            annotations: vec![
+                EdfAnnotation { onset: 0.0, duration: None, texts: vec![] },
+                EdfAnnotation { onset: 0.0, duration: None, texts: vec!["Recording start".into()] },
+            ],
+        };
+
+        let mut buf = Vec::new();
+        write_edf(&edf, &mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = read_edf(&mut cursor).unwrap();
+
+        assert!(parsed.signals.is_empty());
+        assert_eq!(parsed.annotations.len(), 2);
+        assert_eq!(parsed.annotations[1].texts, vec!["Recording start"]);
+    }
+
+    // ── Edge Case Tests: Truncated Input ─────────────────────────────
+
+    #[test]
+    fn test_edge_case_truncated_header_returns_error() {
+        // Edge Case 12: A file that is too short to contain a complete header
+        // (less than 256 bytes) should produce a clear I/O error, not a panic.
+        let truncated = vec![0u8; 100]; // only 100 bytes, need 256 minimum
+        let mut cursor = std::io::Cursor::new(truncated);
+        let result = read_edf(&mut cursor);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_edge_case_truncated_data_record_returns_error() {
+        // A file with a valid header but truncated data records should
+        // produce an error, not silently return partial data.
+        let edf = EdfFile {
+            header: EdfHeader {
+                version: "0".into(),
+                patient_identification: "X X X X".into(),
+                recording_identification: "Startdate X X X X".into(),
+                start_date: "01.01.00".into(),
+                start_time: "00.00.00".into(),
+                header_bytes: 768,
+                reserved: "EDF+C".into(),
+                data_records_count: 2, // claims 2 records
+                data_record_duration: 1.0,
+                signals_count: 2,
+                signal_headers: vec![
+                    make_ordinary_header("EEG", 4),
+                    make_annotation_header(10),
+                ],
+            },
+            signals: vec![EdfSignal {
+                header: make_ordinary_header("EEG", 4),
+                records: vec![
+                    EdfDataRecord { sample: vec![1, 2, 3, 4] },
+                    EdfDataRecord { sample: vec![5, 6, 7, 8] },
+                ],
+            }],
+            annotations: vec![
+                EdfAnnotation { onset: 0.0, duration: None, texts: vec![] },
+                EdfAnnotation { onset: 1.0, duration: None, texts: vec![] },
+            ],
+        };
+
+        let mut full_buf = Vec::new();
+        write_edf(&edf, &mut full_buf).unwrap();
+
+        // Truncate the buffer to remove the second data record
+        let truncated_len = full_buf.len() - 10; // remove last 10 bytes
+        let truncated = full_buf[..truncated_len].to_vec();
+
+        let mut cursor = std::io::Cursor::new(truncated);
+        let result = read_edf(&mut cursor);
+        assert!(result.is_err(), "truncated data should produce an error");
+    }
+
+    // ── Edge Case Tests: data_records_count = -1 (Edge Case 12) ─────
+
+    #[test]
+    fn test_edge_case_data_records_count_negative_one_rejected() {
+        // The EDF spec allows data_records_count = -1 to indicate a file
+        // that hasn't been closed properly (still recording). Our reader
+        // should reject such files because we can't determine how much
+        // data to read.
+        let header = EdfHeader {
+            version: "0".into(),
+            patient_identification: "X X X X".into(),
+            recording_identification: "Startdate X X X X".into(),
+            start_date: "01.01.00".into(),
+            start_time: "00.00.00".into(),
+            header_bytes: 512,
+            reserved: "EDF+C".into(),
+            data_records_count: -1,
+            data_record_duration: 1.0,
+            signals_count: 1,
+            signal_headers: vec![make_ordinary_header("EEG", 4)],
+        };
+
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = read_edf(&mut cursor);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("-1") || err_msg.contains("not properly closed"),
+            "error should mention -1 or unclosed file: {err_msg}");
+    }
+
+    // ── Edge Case Tests: Annotation at Record Boundary (Edge Case 10) ─
+
+    #[test]
+    fn test_edge_case_annotation_at_exact_record_boundary() {
+        // An annotation with onset exactly at a record boundary should be
+        // placed in the second record (onset >= record_start, onset < record_end).
+        // For 1-second records: record 0 = [0, 1), record 1 = [1, 2).
+        // An annotation at onset=1.0 should go in record 1.
+        let annotations = vec![
+            EdfAnnotation { onset: 0.0, duration: None, texts: vec![] },
+            EdfAnnotation { onset: 1.0, duration: None, texts: vec![] },
+            EdfAnnotation { onset: 1.0, duration: None, texts: vec!["At boundary".into()] },
+        ];
+
+        let grouped = group_annotations_by_record(&annotations, 2, 1.0);
+
+        // Record 0: only timekeeping
+        assert_eq!(grouped[0].len(), 1);
+        assert!(grouped[0][0].texts.is_empty());
+
+        // Record 1: timekeeping + boundary annotation
+        assert_eq!(grouped[1].len(), 2);
+        assert!(grouped[1][0].texts.is_empty());
+        assert_eq!(grouped[1][1].texts, vec!["At boundary"]);
+    }
+
+    // ── Edge Case Tests: Zero Data Records ───────────────────────────
+
+    #[test]
+    fn test_edge_case_zero_data_records() {
+        // A file with header_bytes indicating data but data_records_count=0
+        // is valid — it's a header-only file. This can happen when recording
+        // is set up but never started.
+        let edf = EdfFile {
+            header: EdfHeader {
+                version: "0".into(),
+                patient_identification: "X X X X".into(),
+                recording_identification: "Startdate X X X X".into(),
+                start_date: "01.01.00".into(),
+                start_time: "00.00.00".into(),
+                header_bytes: 768,
+                reserved: "EDF+C".into(),
+                data_records_count: 0,
+                data_record_duration: 1.0,
+                signals_count: 2,
+                signal_headers: vec![
+                    make_ordinary_header("EEG", 4),
+                    make_annotation_header(10),
+                ],
+            },
+            signals: vec![EdfSignal {
+                header: make_ordinary_header("EEG", 4),
+                records: vec![], // no data records
+            }],
+            annotations: vec![],
+        };
+
+        let mut buf = Vec::new();
+        write_edf(&edf, &mut buf).unwrap();
+
+        // The file should be exactly header_bytes long (no data section)
+        assert_eq!(buf.len(), 768);
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = read_edf(&mut cursor).unwrap();
+
+        assert_eq!(parsed.signals[0].records.len(), 0);
+        assert!(parsed.annotations.is_empty());
+    }
 }

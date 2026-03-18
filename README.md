@@ -4,10 +4,10 @@
 
 Related works:
 
-- [EDFlib](https://gitlab.com/Teuniz/EDFlib): C/C++ library to read/write EDF+ and BDF+ files.
-- [EDFlib-Java](https://gitlab.com/Teuniz/EDFlib-Java): Java library to read/write EDF+ and BDF+ files.
-- [PyEDFlib](https://pyedflib.readthedocs.io/en/latest/) [code](https://github.com/holgern/pyedflib): Python wavelet toolbox for reading / writing EDF/EDF+/BDF files.
-- [edfplus](https://docs.rs/edfplus/latest/edfplus/) [code](https://github.com/2986002971/edfplus): Rust library for reading and writing EDF+ (European Data Format Plus) files.
+- [EDFlib](https://gitlab.com/Teuniz/EDFlib): C/C++ library to read/write EDF+/BDF+ files.
+- [EDFlib-Java](https://gitlab.com/Teuniz/EDFlib-Java): Java library to read/write EDF+/BDF+ files.
+- [PyEDFlib](https://pyedflib.readthedocs.io/en/latest/) [code](https://github.com/holgern/pyedflib): Python wavelet toolbox to read/write EDF+ files.
+- [edfplus](https://docs.rs/edfplus/latest/edfplus/) [code](https://github.com/2986002971/edfplus): Rust library to read/write EDF+ files.
 
 ## 1. Introduction
 

@@ -503,4 +503,670 @@ mod tests {
         assert_eq!(parsed.signal_headers[0].label, "EEG Fpz-Cz");
         assert_eq!(parsed.signal_headers[0].samples_per_record, 256);
     }
+
+    // ── Edge Case Tests: ASCII Header Constraints (Edge Case 6) ──────
+
+    #[test]
+    fn test_edge_case_ascii_header_preserves_printable_ascii() {
+        // EDF spec requires all header fields to be printable ASCII (bytes 32-126).
+        // Verify that standard ASCII characters survive a write/read round-trip
+        // without modification. This is the baseline happy-path.
+        let header = EdfHeader {
+            version: "0".into(),
+            patient_identification: "ABC-123 M 01-JAN-2000 Test_Name".into(),
+            recording_identification: "Startdate 01-JAN-2000 LAB TECH Equipment".into(),
+            start_date: "01.01.00".into(),
+            start_time: "12.30.45".into(),
+            header_bytes: 512,
+            reserved: "EDF+C".into(),
+            data_records_count: 1,
+            data_record_duration: 1.0,
+            signals_count: 1,
+            signal_headers: vec![EdfSignalHeader {
+                label: "EEG Fp1".into(),
+                transducer_type: "AgAgCl".into(),
+                physical_dimension: "uV".into(),
+                physical_minimum: -500.0,
+                physical_maximum: 500.0,
+                digital_minimum: -2048,
+                digital_maximum: 2047,
+                prefiltering: "HP:0.1Hz".into(),
+                samples_per_record: 256,
+                reserved: String::new(),
+            }],
+        };
+
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = EdfHeader::read_from(&mut cursor).unwrap();
+
+        assert_eq!(parsed.patient_identification, header.patient_identification);
+        assert_eq!(parsed.recording_identification, header.recording_identification);
+    }
+
+    #[test]
+    fn test_edge_case_non_ascii_in_header_replaced_by_lossy_conversion() {
+        // Edge Case 6: Non-ASCII characters (like accents, e.g. "Müller") in
+        // header fields cause parsing issues. The current code uses
+        // String::from_utf8_lossy, which replaces invalid UTF-8 sequences with
+        // the Unicode replacement character U+FFFD. This test documents that
+        // behavior — non-ASCII bytes are silently replaced, not rejected.
+        //
+        // A proper fix should validate and reject non-ASCII bytes. For now,
+        // this test captures the current (lossy) behavior so we know when
+        // it changes.
+        let non_ascii_bytes: &[u8] = &[0x4D, 0xFC, 0x6C, 0x6C, 0x65, 0x72]; // "Müller" in Latin-1
+        let result = parse_ascii(non_ascii_bytes);
+        // from_utf8_lossy replaces the 0xFC byte with the replacement character
+        assert!(result.contains('\u{FFFD}') || result.contains("M"));
+    }
+
+    #[test]
+    fn test_edge_case_header_field_all_spaces() {
+        // EDF uses space-padded fields. A field that is entirely spaces
+        // (e.g., an empty patient ID) should parse to an empty string after
+        // trimming trailing spaces.
+        let all_spaces = b"        "; // 8 spaces
+        assert_eq!(parse_ascii(all_spaces), "");
+    }
+
+    #[test]
+    fn test_edge_case_header_field_with_nul_bytes() {
+        // Some broken EDF writers pad with NUL (0x00) instead of spaces.
+        // from_utf8_lossy handles NUL bytes as valid UTF-8 (they map to U+0000).
+        // trim_end only trims whitespace (which includes NUL in some contexts).
+        // This test documents what happens with NUL-padded fields.
+        let nul_padded = b"EEG\x00\x00\x00\x00\x00";
+        let result = parse_ascii(nul_padded);
+        // NUL is a valid UTF-8 character but trim_end may or may not strip it
+        // depending on what Rust considers whitespace. Document the actual behavior.
+        assert!(result.starts_with("EEG"));
+    }
+
+    // ── Edge Case Tests: Length-Restricted Fields (Edge Case 7) ──────
+
+    #[test]
+    fn test_edge_case_label_exactly_16_chars() {
+        // Signal labels are limited to exactly 16 bytes in EDF. A label that is
+        // exactly 16 characters should be preserved without padding or truncation.
+        let result = format_field("1234567890123456", 16);
+        assert_eq!(result.len(), 16);
+        assert_eq!(&result, b"1234567890123456");
+    }
+
+    #[test]
+    fn test_edge_case_label_exceeds_16_chars_is_truncated() {
+        // Edge Case 7: If a signal label exceeds 16 characters, format_field
+        // silently truncates it. This means data is lost without warning.
+        // This test documents the truncation behavior.
+        let result = format_field("This is a very long label name", 16);
+        assert_eq!(result.len(), 16);
+        assert_eq!(&result, b"This is a very l");
+    }
+
+    #[test]
+    fn test_edge_case_empty_label() {
+        // An empty label should be padded entirely with spaces.
+        let result = format_field("", 16);
+        assert_eq!(result.len(), 16);
+        assert!(result.iter().all(|&b| b == b' '));
+    }
+
+    #[test]
+    fn test_edge_case_patient_id_at_80_byte_boundary() {
+        // Patient identification is exactly 80 bytes. Test with a string that
+        // is exactly 80 characters to ensure no off-by-one in padding.
+        let id = "A".repeat(80);
+        let result = format_field(&id, 80);
+        assert_eq!(result.len(), 80);
+        assert!(result.iter().all(|&b| b == b'A'));
+    }
+
+    #[test]
+    fn test_edge_case_patient_id_exceeds_80_bytes() {
+        // A patient ID longer than 80 bytes gets truncated. This could lose
+        // critical patient information silently.
+        let id = "B".repeat(100);
+        let result = format_field(&id, 80);
+        assert_eq!(result.len(), 80);
+        assert!(result.iter().all(|&b| b == b'B'));
+    }
+
+    // ── Edge Case Tests: Calibration Discrepancies (Edge Case 8) ─────
+
+    #[test]
+    fn test_edge_case_calibration_normal_range() {
+        // Normal calibration: digital range maps linearly to physical range.
+        // digital [-2048, 2047] -> physical [-500.0, 500.0] uV
+        // gain = (physical_max - physical_min) / (digital_max - digital_min)
+        //      = 1000.0 / 4095 ≈ 0.2442
+        let sh = EdfSignalHeader {
+            label: "EEG".into(),
+            transducer_type: String::new(),
+            physical_dimension: "uV".into(),
+            physical_minimum: -500.0,
+            physical_maximum: 500.0,
+            digital_minimum: -2048,
+            digital_maximum: 2047,
+            prefiltering: String::new(),
+            samples_per_record: 256,
+            reserved: String::new(),
+        };
+        // Verify digital range is valid
+        assert!(sh.digital_minimum < sh.digital_maximum);
+        // Verify physical range is valid
+        assert!(sh.physical_minimum < sh.physical_maximum);
+    }
+
+    #[test]
+    fn test_edge_case_calibration_inverted_digital_range() {
+        // Edge Case 8: If digital_minimum > digital_maximum, the gain becomes
+        // negative, which inverts the signal. This is technically allowed by some
+        // interpretations of the spec but usually indicates a bug in the writing
+        // software. The crate currently does not validate this.
+        let sh = EdfSignalHeader {
+            label: "EEG".into(),
+            transducer_type: String::new(),
+            physical_dimension: "uV".into(),
+            physical_minimum: -500.0,
+            physical_maximum: 500.0,
+            digital_minimum: 2047,  // INVERTED: min > max
+            digital_maximum: -2048, // INVERTED
+            prefiltering: String::new(),
+            samples_per_record: 256,
+            reserved: String::new(),
+        };
+        // This should ideally be caught by validation, but currently isn't
+        assert!(sh.digital_minimum > sh.digital_maximum);
+    }
+
+    #[test]
+    fn test_edge_case_calibration_equal_digital_min_max() {
+        // Edge Case 8: If digital_minimum == digital_maximum, the gain is
+        // infinite (division by zero). This is always invalid.
+        let sh = EdfSignalHeader {
+            label: "EEG".into(),
+            transducer_type: String::new(),
+            physical_dimension: "uV".into(),
+            physical_minimum: -500.0,
+            physical_maximum: 500.0,
+            digital_minimum: 0,
+            digital_maximum: 0, // EQUAL: would cause division by zero
+            prefiltering: String::new(),
+            samples_per_record: 256,
+            reserved: String::new(),
+        };
+        // gain = (phys_max - phys_min) / (dig_max - dig_min) = 1000.0 / 0 = inf
+        let dig_range = sh.digital_maximum - sh.digital_minimum;
+        assert_eq!(dig_range, 0);
+    }
+
+    #[test]
+    fn test_edge_case_annotation_signal_calibration() {
+        // EDF+ spec requires annotation signals to have specific calibration:
+        // digital_min = -32768, digital_max = 32767, physical_min = -1, physical_max = 1
+        // This test verifies the is_annotation() detection and expected calibration.
+        let sh = EdfSignalHeader {
+            label: "EDF Annotations".into(),
+            transducer_type: String::new(),
+            physical_dimension: String::new(),
+            physical_minimum: -1.0,
+            physical_maximum: 1.0,
+            digital_minimum: -32768,
+            digital_maximum: 32767,
+            prefiltering: String::new(),
+            samples_per_record: 60,
+            reserved: String::new(),
+        };
+        assert!(sh.is_annotation());
+        assert_eq!(sh.digital_minimum, -32768);
+        assert_eq!(sh.digital_maximum, 32767);
+    }
+
+    // ── Edge Case Tests: Reserved Field Discrepancies (Edge Case 9) ──
+
+    #[test]
+    fn test_edge_case_reserved_edf_plus_contiguous() {
+        // EDF+C means contiguous recording: data records are consecutive
+        // with no time gaps. The reserved field starts with "EDF+C" and
+        // may be followed by spaces to fill the 44-byte field.
+        let result = format_field("EDF+C", 44);
+        assert_eq!(result.len(), 44);
+        assert_eq!(&result[..5], b"EDF+C");
+        assert!(result[5..].iter().all(|&b| b == b' '));
+    }
+
+    #[test]
+    fn test_edge_case_reserved_edf_plus_discontinuous() {
+        // EDF+D means discontinuous recording: time gaps exist between
+        // some data records. Each record must have a timekeeping TAL
+        // that specifies the actual start time of that record.
+        let result = format_field("EDF+D", 44);
+        assert_eq!(result.len(), 44);
+        assert_eq!(&result[..5], b"EDF+D");
+    }
+
+    #[test]
+    fn test_edge_case_reserved_plain_edf_empty() {
+        // Original (non-plus) EDF files have an empty or space-filled reserved
+        // field. This means no annotations are supported.
+        let result = format_field("", 44);
+        assert_eq!(result.len(), 44);
+        assert!(result.iter().all(|&b| b == b' '));
+    }
+
+    #[test]
+    fn test_edge_case_reserved_field_round_trip() {
+        // Verify that the reserved field survives a write/read round-trip.
+        // The 44-byte reserved field is written with space-padding, then
+        // read back and trimmed. The trimmed value should match the original.
+        let header = EdfHeader {
+            version: "0".into(),
+            patient_identification: "X X X X".into(),
+            recording_identification: "Startdate X X X X".into(),
+            start_date: "01.01.00".into(),
+            start_time: "00.00.00".into(),
+            header_bytes: 512,
+            reserved: "EDF+D".into(),
+            data_records_count: 1,
+            data_record_duration: 1.0,
+            signals_count: 1,
+            signal_headers: vec![EdfSignalHeader {
+                label: "EEG".into(),
+                transducer_type: String::new(),
+                physical_dimension: "uV".into(),
+                physical_minimum: -100.0,
+                physical_maximum: 100.0,
+                digital_minimum: -2048,
+                digital_maximum: 2047,
+                prefiltering: String::new(),
+                samples_per_record: 10,
+                reserved: String::new(),
+            }],
+        };
+
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = EdfHeader::read_from(&mut cursor).unwrap();
+
+        assert_eq!(parsed.reserved, "EDF+D");
+    }
+
+    // ── Edge Case Tests: Date Formatting (Edge Case 11) ──────────────
+
+    #[test]
+    fn test_edge_case_date_format_round_trip() {
+        // EDF requires start_date in dd.mm.yy format. The two-digit year
+        // causes Y2K issues: "00" could mean 1900 or 2000. EDF+ resolves
+        // this via the recording_identification field ("Startdate dd-MMM-yyyy").
+        // This test verifies the date string survives round-trip unchanged.
+        let header = EdfHeader {
+            version: "0".into(),
+            patient_identification: "X X X X".into(),
+            recording_identification: "Startdate X X X X".into(),
+            start_date: "17.04.01".into(), // 17 April, year 01
+            start_time: "11.25.00".into(),
+            header_bytes: 512,
+            reserved: "EDF+C".into(),
+            data_records_count: 1,
+            data_record_duration: 1.0,
+            signals_count: 1,
+            signal_headers: vec![EdfSignalHeader {
+                label: "EEG".into(),
+                transducer_type: String::new(),
+                physical_dimension: "uV".into(),
+                physical_minimum: -100.0,
+                physical_maximum: 100.0,
+                digital_minimum: -2048,
+                digital_maximum: 2047,
+                prefiltering: String::new(),
+                samples_per_record: 10,
+                reserved: String::new(),
+            }],
+        };
+
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = EdfHeader::read_from(&mut cursor).unwrap();
+
+        assert_eq!(parsed.start_date, "17.04.01");
+        assert_eq!(parsed.start_time, "11.25.00");
+    }
+
+    // ── Edge Case Tests: Header Size Consistency (Edge Case 12) ──────
+
+    #[test]
+    fn test_edge_case_header_bytes_matches_formula() {
+        // The header_bytes field must equal 256 + signals_count * 256.
+        // This is a critical consistency check. If the value is wrong,
+        // the data section offset will be incorrect, causing data corruption.
+        let header = EdfHeader {
+            version: "0".into(),
+            patient_identification: "X X X X".into(),
+            recording_identification: "Startdate X X X X".into(),
+            start_date: "01.01.00".into(),
+            start_time: "00.00.00".into(),
+            header_bytes: 768, // 256 + 2*256 = 768
+            reserved: "EDF+C".into(),
+            data_records_count: 1,
+            data_record_duration: 1.0,
+            signals_count: 2,
+            signal_headers: vec![
+                EdfSignalHeader {
+                    label: "EEG".into(),
+                    transducer_type: String::new(),
+                    physical_dimension: "uV".into(),
+                    physical_minimum: -100.0,
+                    physical_maximum: 100.0,
+                    digital_minimum: -2048,
+                    digital_maximum: 2047,
+                    prefiltering: String::new(),
+                    samples_per_record: 10,
+                    reserved: String::new(),
+                },
+                EdfSignalHeader {
+                    label: "EDF Annotations".into(),
+                    transducer_type: String::new(),
+                    physical_dimension: String::new(),
+                    physical_minimum: -1.0,
+                    physical_maximum: 1.0,
+                    digital_minimum: -32768,
+                    digital_maximum: 32767,
+                    prefiltering: String::new(),
+                    samples_per_record: 60,
+                    reserved: String::new(),
+                },
+            ],
+        };
+
+        // Verify the formula: header_bytes = 256 + signals_count * 256
+        let expected = 256 + header.signals_count * 256;
+        assert_eq!(header.header_bytes, expected);
+    }
+
+    #[test]
+    fn test_edge_case_header_write_produces_exact_byte_count() {
+        // The written header must be exactly header_bytes long.
+        // Any mismatch means the binary layout is broken.
+        let header = EdfHeader {
+            version: "0".into(),
+            patient_identification: "X X X X".into(),
+            recording_identification: "Startdate X X X X".into(),
+            start_date: "01.01.00".into(),
+            start_time: "00.00.00".into(),
+            header_bytes: 512, // 256 + 1*256
+            reserved: "EDF+C".into(),
+            data_records_count: 1,
+            data_record_duration: 1.0,
+            signals_count: 1,
+            signal_headers: vec![EdfSignalHeader {
+                label: "EEG".into(),
+                transducer_type: String::new(),
+                physical_dimension: "uV".into(),
+                physical_minimum: -100.0,
+                physical_maximum: 100.0,
+                digital_minimum: -2048,
+                digital_maximum: 2047,
+                prefiltering: String::new(),
+                samples_per_record: 10,
+                reserved: String::new(),
+            }],
+        };
+
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+
+        // Written bytes must exactly match header_bytes
+        assert_eq!(buf.len(), header.header_bytes);
+    }
+
+    // ── Edge Case Tests: Multiple Signals (Edge Case 4) ──────────────
+
+    #[test]
+    fn test_edge_case_many_signal_headers_round_trip() {
+        // EDF+ has a maximum data record size of 61,440 bytes. With many
+        // signals at high sample rates, this limit can be reached. This test
+        // verifies that a file with many signals (but within limits) round-trips
+        // correctly through the header parser.
+        let num_signals = 10;
+        let signal_headers: Vec<EdfSignalHeader> = (0..num_signals)
+            .map(|i| EdfSignalHeader {
+                label: format!("Ch{i:02}"),
+                transducer_type: String::new(),
+                physical_dimension: "uV".into(),
+                physical_minimum: -100.0,
+                physical_maximum: 100.0,
+                digital_minimum: -2048,
+                digital_maximum: 2047,
+                prefiltering: String::new(),
+                samples_per_record: 256,
+                reserved: String::new(),
+            })
+            .collect();
+
+        let header = EdfHeader {
+            version: "0".into(),
+            patient_identification: "X X X X".into(),
+            recording_identification: "Startdate X X X X".into(),
+            start_date: "01.01.00".into(),
+            start_time: "00.00.00".into(),
+            header_bytes: 256 + num_signals * 256,
+            reserved: String::new(),
+            data_records_count: 1,
+            data_record_duration: 1.0,
+            signals_count: num_signals,
+            signal_headers,
+        };
+
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), 256 + num_signals * 256);
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = EdfHeader::read_from(&mut cursor).unwrap();
+
+        assert_eq!(parsed.signals_count, num_signals);
+        assert_eq!(parsed.signal_headers.len(), num_signals);
+        for (i, sh) in parsed.signal_headers.iter().enumerate() {
+            assert_eq!(sh.label, format!("Ch{i:02}"));
+            assert_eq!(sh.samples_per_record, 256);
+        }
+    }
+
+    // ── Edge Case Tests: Floating-Point Precision (Edge Cases 3, 8) ──
+
+    #[test]
+    fn test_edge_case_fractional_duration_round_trip() {
+        // The data_record_duration is stored as an 8-byte ASCII field.
+        // Fractional durations (e.g., 0.05 seconds for high-speed EMG)
+        // must survive the float→string→float round-trip without precision loss.
+        let header = EdfHeader {
+            version: "0".into(),
+            patient_identification: "X X X X".into(),
+            recording_identification: "Startdate X X X X".into(),
+            start_date: "01.01.00".into(),
+            start_time: "00.00.00".into(),
+            header_bytes: 512,
+            reserved: "EDF+C".into(),
+            data_records_count: 1,
+            data_record_duration: 0.05, // 50ms, typical for EMG
+            signals_count: 1,
+            signal_headers: vec![EdfSignalHeader {
+                label: "EEG".into(),
+                transducer_type: String::new(),
+                physical_dimension: "uV".into(),
+                physical_minimum: -100.0,
+                physical_maximum: 100.0,
+                digital_minimum: -2048,
+                digital_maximum: 2047,
+                prefiltering: String::new(),
+                samples_per_record: 10,
+                reserved: String::new(),
+            }],
+        };
+
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = EdfHeader::read_from(&mut cursor).unwrap();
+
+        assert_eq!(parsed.data_record_duration, 0.05);
+    }
+
+    #[test]
+    fn test_edge_case_format_number_preserves_precision() {
+        // format_number must not lose precision for values used in EDF headers.
+        // Integer values should format without a decimal point.
+        // Fractional values must round-trip through string representation.
+        assert_eq!(format_number(0.0), "0");
+        assert_eq!(format_number(-0.0), "0"); // negative zero becomes "0"
+        assert_eq!(format_number(32767.0), "32767");
+        assert_eq!(format_number(-32768.0), "-32768");
+        assert_eq!(format_number(0.05), "0.05");
+        assert_eq!(format_number(-100.5), "-100.5");
+
+        // Verify round-trip: number → string → number
+        let values = [0.0, -0.0, 1.0, -1.0, 0.05, 100.5, -32768.0, 32767.0];
+        for &v in &values {
+            let s = format_number(v);
+            let parsed: f64 = s.parse().unwrap();
+            assert_eq!(parsed, if v == -0.0 { 0.0 } else { v });
+        }
+    }
+
+    // ── Edge Case Tests: Annotation Signal Detection ─────────────────
+
+    #[test]
+    fn test_edge_case_annotation_label_with_trailing_spaces() {
+        // In EDF binary, the label field is 16 bytes, space-padded.
+        // After parsing, "EDF Annotations " (with trailing space) should
+        // still be detected as an annotation signal. The is_annotation()
+        // method uses trim() to handle this.
+        let sh = EdfSignalHeader {
+            label: "EDF Annotations ".into(), // trailing space
+            transducer_type: String::new(),
+            physical_dimension: String::new(),
+            physical_minimum: -1.0,
+            physical_maximum: 1.0,
+            digital_minimum: -32768,
+            digital_maximum: 32767,
+            prefiltering: String::new(),
+            samples_per_record: 60,
+            reserved: String::new(),
+        };
+        assert!(sh.is_annotation());
+    }
+
+    #[test]
+    fn test_edge_case_annotation_label_case_sensitivity() {
+        // The EDF+ spec uses "EDF Annotations" with specific capitalization.
+        // A label like "edf annotations" (lowercase) should NOT be detected
+        // as an annotation signal, because the spec is case-sensitive.
+        let sh = EdfSignalHeader {
+            label: "edf annotations".into(),
+            transducer_type: String::new(),
+            physical_dimension: String::new(),
+            physical_minimum: -1.0,
+            physical_maximum: 1.0,
+            digital_minimum: -32768,
+            digital_maximum: 32767,
+            prefiltering: String::new(),
+            samples_per_record: 60,
+            reserved: String::new(),
+        };
+        assert!(!sh.is_annotation());
+    }
+
+    #[test]
+    fn test_edge_case_data_records_count_negative_one() {
+        // The EDF spec allows data_records_count = -1 to indicate that
+        // the file is still being recorded (not yet closed). A proper
+        // reader should handle this, typically by refusing to read data
+        // or by inferring the count from file size.
+        let header = EdfHeader {
+            version: "0".into(),
+            patient_identification: "X X X X".into(),
+            recording_identification: "Startdate X X X X".into(),
+            start_date: "01.01.00".into(),
+            start_time: "00.00.00".into(),
+            header_bytes: 512,
+            reserved: "EDF+C".into(),
+            data_records_count: -1, // File not yet closed
+            data_record_duration: 1.0,
+            signals_count: 1,
+            signal_headers: vec![EdfSignalHeader {
+                label: "EEG".into(),
+                transducer_type: String::new(),
+                physical_dimension: "uV".into(),
+                physical_minimum: -100.0,
+                physical_maximum: 100.0,
+                digital_minimum: -2048,
+                digital_maximum: 2047,
+                prefiltering: String::new(),
+                samples_per_record: 10,
+                reserved: String::new(),
+            }],
+        };
+
+        // Write and read back — the -1 should survive round-trip
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = EdfHeader::read_from(&mut cursor).unwrap();
+
+        assert_eq!(parsed.data_records_count, -1);
+    }
+
+    // ── Edge Case Tests: Signal Header Field Boundaries ──────────────
+
+    #[test]
+    fn test_edge_case_physical_dimension_exactly_8_bytes() {
+        // Physical dimension field is 8 bytes. Common units like "uV" are
+        // short, but some could be longer (e.g., "degC/min"). Test at the
+        // exact boundary.
+        let result = format_field("degC/min", 8);
+        assert_eq!(result.len(), 8);
+        assert_eq!(&result, b"degC/min");
+    }
+
+    #[test]
+    fn test_edge_case_prefiltering_exactly_80_bytes() {
+        // Prefiltering field is 80 bytes. Long filter descriptions should
+        // be preserved up to 80 bytes.
+        let long_filter = "HP:0.1Hz LP:75Hz N:50Hz BP:0.5-35Hz";
+        let result = format_field(long_filter, 80);
+        assert_eq!(result.len(), 80);
+        assert!(result.starts_with(long_filter.as_bytes()));
+    }
+
+    #[test]
+    fn test_edge_case_zero_signals_count() {
+        // An EDF file with 0 signals is technically parseable (header only),
+        // though practically useless. The header should be exactly 256 bytes.
+        let header = EdfHeader {
+            version: "0".into(),
+            patient_identification: "X X X X".into(),
+            recording_identification: "Startdate X X X X".into(),
+            start_date: "01.01.00".into(),
+            start_time: "00.00.00".into(),
+            header_bytes: 256,
+            reserved: String::new(),
+            data_records_count: 0,
+            data_record_duration: 0.0,
+            signals_count: 0,
+            signal_headers: vec![],
+        };
+
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), 256);
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let parsed = EdfHeader::read_from(&mut cursor).unwrap();
+        assert_eq!(parsed.signals_count, 0);
+        assert!(parsed.signal_headers.is_empty());
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "european-data-format"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Joel Parker Henderson <joel@joelparkerhenderson.com>"]
 description = "European Data Format (EDF/EDF+) utilities to read and write EDF files, EDF+ files, XML files, JSON files."
